@@ -1,0 +1,163 @@
+name: Build & Deploy to AWS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        required: true
+        default: production
+        type: choice
+        options: [production, staging]
+
+env:
+  AWS_REGION:   us-east-1
+  ECR_REPO:     chesscoach
+  STACK_NAME:   chesscoach
+  IMAGE_TAG:    ${{ github.sha }}
+
+jobs:
+  # ── 1. Python tests ──────────────────────────────────────────────────────────
+  test-backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+
+      - name: Install backend deps
+        run: pip install -r backend/requirements.txt
+        working-directory: chess_coach_web
+
+      - name: Lint
+        run: pip install ruff && ruff check backend/ --ignore E501
+        working-directory: chess_coach_web
+
+      - name: Syntax check all modules
+        run: |
+          python -m py_compile backend/main.py
+          python -m py_compile backend/chesslogic/core/game_session.py
+          python -m py_compile backend/chesslogic/core/game_analyzer_async.py
+          python -m py_compile backend/chesslogic/engine/engine_manager.py
+          python -m py_compile backend/chesslogic/coach/chess_coach_engine.py
+          python -m py_compile backend/chesslogic/openings/opening_recognizer.py
+        working-directory: chess_coach_web
+
+  # ── 2. Frontend build ────────────────────────────────────────────────────────
+  build-frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with: { node-version: "20" }
+
+      - name: Install & build
+        run: |
+          npm install --legacy-peer-deps
+          npm run build
+        working-directory: chess_coach_web/frontend
+
+      - name: Upload built frontend
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: chess_coach_web/backend/static/
+          retention-days: 1
+
+  # ── 3. Docker build & push ───────────────────────────────────────────────────
+  docker:
+    needs: [test-backend, build-frontend]
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.image.outputs.uri }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download built frontend
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: chess_coach_web/backend/static/
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build & push image
+        id: image
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          IMAGE="$REGISTRY/$ECR_REPO:$IMAGE_TAG"
+          docker build -t "$IMAGE" chess_coach_web/ \
+            --label "git-sha=${{ github.sha }}" \
+            --label "built-at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          docker push "$IMAGE"
+          # Also tag as latest
+          docker tag "$IMAGE" "$REGISTRY/$ECR_REPO:latest"
+          docker push "$REGISTRY/$ECR_REPO:latest"
+          echo "uri=$IMAGE" >> "$GITHUB_OUTPUT"
+
+  # ── 4. Deploy to ECS ─────────────────────────────────────────────────────────
+  deploy:
+    needs: docker
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'production' }}
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Get ECS info from CloudFormation
+        id: cfn
+        run: |
+          CLUSTER=$(aws cloudformation describe-stacks \
+            --stack-name $STACK_NAME \
+            --query "Stacks[0].Outputs[?OutputKey=='ECSCluster'].OutputValue" \
+            --output text)
+          SERVICE=$(aws cloudformation describe-stacks \
+            --stack-name $STACK_NAME \
+            --query "Stacks[0].Outputs[?OutputKey=='ECSService'].OutputValue" \
+            --output text)
+          echo "cluster=$CLUSTER" >> "$GITHUB_OUTPUT"
+          echo "service=$SERVICE" >> "$GITHUB_OUTPUT"
+
+      - name: Force new ECS deployment
+        run: |
+          aws ecs update-service \
+            --cluster "${{ steps.cfn.outputs.cluster }}" \
+            --service  "${{ steps.cfn.outputs.service }}" \
+            --force-new-deployment \
+            --query "service.serviceName" \
+            --output text
+
+      - name: Wait for stable deployment
+        run: |
+          aws ecs wait services-stable \
+            --cluster "${{ steps.cfn.outputs.cluster }}" \
+            --services "${{ steps.cfn.outputs.service }}"
+
+      - name: Print deployed URL
+        run: |
+          URL=$(aws cloudformation describe-stacks \
+            --stack-name $STACK_NAME \
+            --query "Stacks[0].Outputs[?OutputKey=='AppURL'].OutputValue" \
+            --output text)
+          echo "### ✅ Deployed to $URL" >> "$GITHUB_STEP_SUMMARY"
+          echo "Image: ${{ needs.docker.outputs.image }}" >> "$GITHUB_STEP_SUMMARY"
